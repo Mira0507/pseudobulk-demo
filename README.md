@@ -7,6 +7,8 @@ Scanpy's [AnnData](https://anndata.readthedocs.io/en/stable/) and Seurat object 
 analysis and data visualization. However, the current workflow is designed to use a Seurat object
 as input. 
 
+By default, pseudobulk count matrices are prepared by aggregating read counts per gene per sample. 
+
 ## Repository structure
 
 ```
@@ -19,4 +21,21 @@ $ tree
 
 ```
 
-
+- `helpers.R`: helper functions
+- `scripts/pseudobulk_de.Rmd`
+    - Single cell metadata
+    - Single cell stats by sample, cluster, and experimental condition
+    (nCount_RNA, nFeature_RNA, nCells)
+    - UMAP by sample, cluster, and experimental condition
+    - Absolute and cumulative cell proportion
+    - Pseudobulk quality control
+        - cluster similarity heatmap
+        - PCA
+        - Size factors
+        - Dispersion-mean plot
+        - Differential testing
+    - Exploratory plots
+        - MA plots
+        - P-value distribution
+        - [UpSet plots](https://upset.app/)
+    - Result tables
