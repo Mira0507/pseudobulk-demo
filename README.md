@@ -8,6 +8,11 @@ analysis and data visualization. However, the current workflow is designed to us
 as input. 
 
 By default, pseudobulk count matrices are prepared by aggregating read counts per gene per sample. 
+DE testing is performed using [DESeq2](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-014-0550-8),
+relying on negative binomial distribution. Pseudobulk analysis is more robust when analyzing
+differentially expressed genes (DEGs) for single cell dataset by conserving biological variability.
+Moreover, pseudobulk analysis enables to remove bias arising from cell number, associated with 
+statistical power in null hypothesis testing.
 
 ## Repository structure
 
