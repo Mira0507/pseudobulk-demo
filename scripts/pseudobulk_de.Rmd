@@ -1,0 +1,970 @@
+---
+title: "Pseudobulk Differential Expression (DE) Analysis"
+output: 
+    html_document:
+        code_folding: hide
+        toc: true
+        toc_float: true
+        toc_depth: 3
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE,
+                      cache.lazy=FALSE,
+                      fig.width=10,
+                      fig.height=8,
+                      message=FALSE)
+```
+
+```{r packages_and_functions, include=FALSE}
+library(Seurat)
+library(ggplot2)
+library(DESeq2)
+library(ensembldb)
+library(AnnotationHub)
+library(plotly)
+library(parallel)
+library(BiocParallel)
+library(future)
+library(tidyverse)
+library(Matrix)
+library(DT)
+library(UpSetR)
+
+set.seed(1237)
+source('helpers.R')
+```
+
+
+```{r parallelize, include=FALSE}
+
+# Assign the number of cores for parallelization
+ncpus <- future::availableCores()
+# 
+# # Adjust max memory allowed
+options(future.globals.maxSize=40000 * 1024^2,
+        mc.cores=ncpus)
+
+# Parallelize the run
+plan("multicore", workers=ncpus)
+```
+
+This workflow is aimed to analyze differentially expressed genes (DEGs) between subtypes 
+motor neurons (MNs) in the cholinergic subset of WT and KO mice.
+
+Total datasets were integrated and clustered using scanpy/scVI pipeline here:
+
+* [`scanpy-qc-unintegrated-all.html`](../../scanpy/scripts-rerun/scanpy-qc-unintegrated-all.html)
+* [`scanpy-unintegrated-markers-all.html`](../../scanpy/scripts-rerun/scanpy-unintegrated-markers-all.html)
+* [`scanpy-integration-all.html`](../../scanpy/scripts-rerun/scanpy-integration-all.html)
+* [`scanpy-integrated-markers-all.html`](../../scanpy/scripts-rerun/scanpy-integrated-markers-all.html)
+
+Afterwards, cholinergic neurons were subsetted in [`scanpy-post-analysis.html`](scanpy-post-analysis.html). 
+
+```{r config}
+
+########################## CHANGE ##########################
+
+# Path to seurat obj
+seurat.path <- 'path/to/leiden_2.0_chat_subset.rds'
+
+# Path to sampletable
+sampletable.path <- 'sampletable.tsv'
+
+# Directory for outfile files
+de.out <- 'output'
+rds <- 'rds'
+
+# Path to aggregated counts extracted from seurat obj
+aggregated.raw <- file.path(de.out, 'neuron_raw_count.tsv')
+
+# Assign sample/genotype/sex/region colors
+genotype.colors <- c(WT="#143e2f", KO="#bca81f")
+sex.colors <- c(F="#491426", M="#ba9355")
+age.colors <- c(
+    `6w`='#18b76c',
+    `10w`='#e5c308',
+    `12w`='#7a5519',
+    `14w`='#8e9a03',
+    `18w`='#ba9355')
+
+# Assign metadata columns of interest in seurat metadata (`obj@meta.data`)
+metacol.interest <- c(
+    'samplename',
+    'group',
+    'sex',
+    'age',
+    'leiden_2.0',
+    'scvi_leiden_1.4'
+)
+
+# Seurat metadata column to be used for aggregating read counts
+rep.col <- "leiden_2.0"
+
+# Clusters of interest
+de.clusters <- c(0, 3, 61, 62)
+
+# Outlier sample (set to FALSE for omitting outlier removal)
+outlier <- ''
+
+# Set cutoffs for log2FoldChange and FDR
+lfc.thresh <- 0
+alpha <- 0.1
+
+# `fitType` argument in `DESeq()` function
+# options: "parametric", "local", "mean", "glmGamPoi"
+fit.type <- ""
+
+
+########################## DO NOT CHANGE ##########################
+# Don't change this line
+for (d in c(de.out, rds)) {
+    if ( !dir.exists(d) ) { dir.create(d) }
+}
+
+```
+
+
+```{r functions}
+
+# Define a function printing annotation summary
+print.summary <- function(meta.colname, color.option, label, level) {
+
+
+    mdcat('Cell number table {.tabset}', level=level)
+    print(knitr::kable(obj@meta.data %>%
+                       group_by_at(meta.colname) %>%
+                       summarize(nCell=n())))
+
+    # Explore UMAP for clustering on SCT
+    mdcat('UMAP (Unintegrated) {.tabset}', level=level)
+    print(DimPlot(obj,
+                  reduction='unintegrated_umap',
+                  group.by=meta.colname,
+                  label=label,
+                  repel=label,
+                  cols=color.option))
+
+
+    # Explore UMAP for clustering on SCT
+    mdcat('UMAP (Integrated) {.tabset}', level=level)
+    print(DimPlot(obj,
+                  reduction='umap',
+                  label=label,
+                  repel=label,
+                  group.by=meta.colname,
+                  cols=color.option))
+}
+
+```
+
+
+
+```{r import_data, cache=TRUE}
+# Import seruat obj
+obj <- readRDS(seurat.path)
+
+# Import sampletable
+sampletable <- read.table(sampletable.path, header=TRUE)
+
+# Clean metadata
+obj@meta.data <- obj@meta.data %>%
+    mutate(samplename=factor(samplename, levels=sampletable$samplename)) %>%
+    tidyr::separate(samplename, c('age', 'genotype', 'sex', 'rep'), remove=FALSE) %>%
+    mutate(
+        age=factor(age, levels=names(age.colors)),
+        genotype=factor(genotype, levels=names(genotype.colors)),
+        sex=factor(sex, levels=names(sex.colors))
+    )
+
+```
+
+# Metadata imported from Seurat
+
+- `samplename`: per dataset
+- `group`: per age and genotype
+- `sex`: per sex
+- `genotype`: per genotype
+- `leiden_2.0`: unintegrated clustering, computed using scanpy
+- `scvi_leiden_1.4`: integrated clustering, computed using scVI
+
+
+```{r meta_values}
+
+sliced.meta <- obj@meta.data[, metacol.interest]
+print('Unique values from each variable:')
+print(apply(sliced.meta, 2, unique))
+
+```
+
+
+# Dataset {.tabset}
+
+
+```{r overview, results='asis'}
+
+mdcat('Cell stat', level=2)
+print(knitr::kable(
+    obj@meta.data %>%
+        group_by(samplename) %>%
+        dplyr::summarize(
+            median_nCount_RNA=median(nCount_RNA),
+            mean_nCount_RNA=mean(nCount_RNA),
+            sum_nCount_RNA=sum(nCount_RNA),
+            median_nFeature_RNA=median(nFeature_RNA),
+            mean_nFeature_RNA=mean(nFeature_RNA),
+            sum_nFeature_RNA=sum(nFeature_RNA),
+            nCell=dplyr::n()
+            )
+        )
+)
+
+variable.list <- list(
+    `Cluster (leiden_2.0)`=list('leiden_2.0', NULL),
+    `Cluster (scvi_leiden_1.4)`=list('scvi_leiden_1.4', NULL),
+    Group=list('group', NULL),
+    Genotype=list('genotype', genotype.colors),
+    Sex=list('sex', sex.colors)
+    )
+
+for (name in names(variable.list)) {
+    mdcat(name, '{.tabset}\n\n', level=2)
+    label=ifelse(str_detect(name, 'Cluster'), TRUE, FALSE)
+    print.summary(
+        variable.list[[name]][[1]],
+        variable.list[[name]][[2]],
+        label,
+        3)
+    }
+
+```
+
+# Subsets of interest {.tabset}
+
+Here we subset clusters of interest.
+
+
+```{r prep_count_matrix, cache=TRUE, dependson='import_data'}
+
+# -------------------------- EDIT MANUALLY ----------------------------
+
+# Subset the obj by cluster
+obj <- subset(obj, leiden_2.0 %in% de.clusters)
+
+# Retrieve raw count matrix from the seurat obj
+# NOTE: call `obj@assays$RNA@data` for normalized counts
+count.mtx <- as.matrix(obj@assays$RNA@counts)
+
+# Retrieve the seurat metadata
+meta.df <- sliced.meta[colnames(count.mtx),] %>%
+    rownames_to_column('Barcode')
+
+
+# Build a data frame for count and metadata
+count.pre.df <- count.mtx %>%
+    as.data.frame() %>%
+    rownames_to_column('Symbol') %>%
+    gather('Barcode', 'Count', -Symbol) %>%
+    inner_join(meta.df, by='Barcode') %>%
+    unite('group_cluster', samplename, leiden_2.0, remove=FALSE)
+
+# Update the list to store aggregated counts per gene per bio rep
+count.df <- count.pre.df %>%
+        group_by(Symbol, group_cluster) %>%
+        summarize(Count=sum(Count)) %>%
+        spread(group_cluster, 'Count') %>%
+        column_to_rownames('Symbol')
+
+# Save cleaned count matrices
+write.table(count.df,
+            aggregated.raw,
+            quote=FALSE,
+            col.names=TRUE,
+            row.names=TRUE,
+            sep='\t')
+```
+
+```{r explore_subset, results='asis', cache=TRUE, dependson='prep_count_matrix', fig.height=4, fig.width=8}
+
+# Manipulate a data frame for cell numbers
+p.df <- count.pre.df %>%
+    group_by(samplename, leiden_2.0) %>%
+    summarize(nCell=n()) %>%
+    inner_join(
+        count.pre.df %>% group_by(samplename) %>% summarize(nCell_total=n()),
+        by='samplename') %>%
+    mutate(Proportion=round(nCell/nCell_total * 100, digits=2),
+           group=factor(samplename, levels=levels(obj$samplename))) %>%
+    as.data.frame() %>%
+    dplyr::select(-group)
+    
+mdcat('Cell Number Table', level=2)
+datatable(p.df)
+
+mdcat('Cell Number Plot', level=2)
+p <- ggplot(p.df, aes(x=samplename, y=nCell, fill=leiden_2.0)) +
+    geom_bar(stat='identity', position='stack', width=0.5) +
+    theme_bw() +
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ylab("nCell")
+
+print(p)
+
+mdcat('Cell Proportion Plot', level=2)
+p <- ggplot(p.df, aes(x=samplename, y=Proportion, fill=leiden_2.0)) +
+    geom_bar(stat='identity', position='stack', width=0.5) +
+    theme_bw() +
+    ylab("Proportion (%)") +
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1))
+
+print(p)
+```
+
+# Sample table for DE testing {.tabset}
+
+
+Following sample tables will be used as metadata for DE analysis.
+
+
+```{r prep_metadata, results='asis', cache=TRUE, dependson='prep_count_matrix'}
+
+# ---------------------- EDIT MANUALLY! -----------------------------
+
+# Build DESeq2 metadata
+coldata.df <- data.frame(samplename=colnames(count.df)) %>%
+    separate(samplename, c('age', 'genotype', 'sex', 'rep', 'cluster'), remove=FALSE) %>%
+    column_to_rownames('samplename') %>%
+    mutate(
+        age=factor(age, levels(obj$age)),
+        genotype=factor(genotype, levels(obj$genotype)), 
+        cluster=factor(cluster, levels(obj$leiden_2.0)))
+
+# Reorder rows to match identical order to count table
+coldata.df <- coldata.df[colnames(count.df),]
+
+# Delete seurat obj
+rm(obj)
+
+# Create a list storing coldata filtered by pairwise clusters
+coldata.list <- list(
+    cluster_MN=coldata.df,
+    cluater3_cluster0=coldata.df[coldata.df$cluster %in% c(0, 3),],
+    cluster61_cluster0=coldata.df[coldata.df$cluster %in% c(0, 61),],
+    cluster62_cluster0=coldata.df[coldata.df$cluster %in% c(0, 62),],
+    cluster61_cluster3=coldata.df[coldata.df$cluster %in% c(3, 61),],
+    cluster62_cluster3=coldata.df[coldata.df$cluster %in% c(3, 62),],
+    cluster62_cluster61=coldata.df[coldata.df$cluster %in% c(61, 62),]
+    )
+
+for (name in names(coldata.list)) {
+    mdcat(name, level=2)
+    df <- coldata.list[[name]]
+    subchunkify(name)
+}
+```
+
+```{r setup_deseq2, cache=TRUE, dependson='prep_metadata'}
+
+# Build a list of dds obj
+dds.list <- mclapply(
+    names(coldata.list),
+    function(name) DESeqDataSetFromMatrix(
+        count.df[, rownames(coldata.list[[name]])],
+        colData=coldata.list[[name]],
+        design=~cluster + 0
+        )
+    ) %>%
+    set_names(names(coldata.list))
+
+# Run DESeq2
+dds.list <- lapply(
+    dds.list,
+    DESeq,
+    parallel=TRUE
+    )
+
+# Run vst
+vsd.list <- mclapply(
+    dds.list, 
+    varianceStabilizingTransformation,
+    blind=TRUE)
+
+```
+
+
+# Sample similarity and QC
+
+## Clustered heatmap {.tabset}
+
+The following heatmap shows a hierarchical clustering of pairwise distances between samples. 
+Darker blue means less distant (i.e. more similar). In general we expect to see replicates 
+clustering together and separation of treatments.
+
+
+```{r sample_heatmap, results='asis'}
+
+# Set color to be displayed
+colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'Blues')))(255)
+
+subchunkify.heatmap <- function(name) {
+    t_deparsed <- "
+        heatmaply::heatmaply(
+        sampleDistMatrix,
+        scale='none',
+        col=colors,
+        row_side_colors=heatmap.metadata,
+        showticklabels=c(FALSE, TRUE)
+        )"
+    sub_chunk <- paste0(
+        "```{r sub_chunk_",
+        name,
+        ", results='asis', echo=FALSE, fig.width=14, fig.height=12}",
+        "\n",
+        t_deparsed,
+        "\n\n```\n\n\n")
+
+    cat(knitr::knit(text = sub_chunk, quiet=TRUE))
+}
+
+# Create heatmap input matrix
+for (name in names(vsd.list)) {
+
+    vsd <- vsd.list[[name]]
+    heatmap.metadata <- coldata.list[[name]]
+    sampleDists <- dist(t(assay(vsd)))
+    sampleDistMatrix <- as.matrix(sampleDists)
+    rownames(sampleDistMatrix) <- colnames(vsd)
+
+    # Print vsd
+    cat('###', name, '\n\n')
+
+    subchunkify.heatmap(name)
+    cat('\n\n')
+    }
+
+
+```
+
+## PCA {.tabset}
+
+Another way of looking at sample clustering is principal components analysis (PCA). The x- and 
+y-axes do not have units, rather, they represent the dimensions along which the samples vary 
+the most. The amount of variance explained by each principal component is indicated in the axes label.
+
+
+```{r pca, results='asis'}
+
+for (name in names(vsd.list)) {
+    vsd <- vsd.list[[name]]
+    cat('###', name, '{.tabset}\n\n')
+    for (col in colnames(coldata.df)) {
+        cat('####', col, '\n\n')
+        mat <- plotPCA(vsd, col, returnData=TRUE)
+        pv <- attr(mat, 'percentVar')
+        p <- ggplot(data=mat, aes_string(x='PC1', y='PC2', color='group', label='name')) +
+            geom_point(size=2) + xlab(paste0('PC1: ', round(pv[1]*100), '% variance')) +
+            ylab(paste0('PC2: ', round(pv[2]*100), '% variance')) + coord_fixed()
+        subchunkify(name, input='plot')
+        cat('\n\n')
+        }
+    }
+```
+
+
+## Size factors {.tabset}
+
+Ideally, all libraries were sequenced to identical depth, in which case all size factors would be 1.0. 
+In practice, this is almost never the case due to the difficulties of accurately measuring low 
+concentrations of cDNA. DESeq2 uses size factor estimates to normalized for sequencing depth across
+libraries. If some libraries are much higher or lower than 1 then those libraries had dramatically
+different coverage and we should be careful about interpreting results.
+
+Simply taking the total number of reads has been shown to be too sensitive to a small number of 
+highly-expressed genes. DESeq2’s size factors are calculated according to the median-ratio method 
+(equation 5 of Anders & Huber 2010).
+
+These diagnostic plots show the size factors (as a ranked bar plot) and the relationship between 
+the size factors and the total read count (as a scatterplot). Samples whose total read count differs 
+from size factor may indicate that the sample has a small number of highly expressed genes.
+
+
+```{r size_factors, results='asis', fig.height=6, fig.width=8}
+
+for (name in names(dds.list)) {
+    cat('###', name, '{.tabset}\n\n')
+    dds <- estimateSizeFactors(dds.list[[name]])
+    sf <- sizeFactors(dds)
+    sf <- sf[order(sf)] %>%
+            tibble::enframe(value = 'Size Factor')
+    p <- ggplot(sf) +
+        aes(x=reorder(name, `Size Factor`), y=`Size Factor`) +
+        xlab('cluster') +
+        geom_col() +
+        theme_bw() +
+        theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1))
+
+    cat('#### Size factors\n\n')
+    subchunkify(paste(name, '_sizefactor1'), input='plot', width=10)
+    cat('\n\n')
+
+    trc <- colSums(counts(dds)) %>%
+            tibble::enframe(value = 'Total Read Count')
+    trc_vs_sf <- dplyr::full_join(sf, trc, by='name')
+    p <- ggplot(data=trc_vs_sf,
+                aes_string(x="`Total Read Count`", y="`Size Factor`", label='name')) +
+        geom_point(size=3) +
+        theme_bw() +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+    cat('#### Size factors vs total read counts\n\n')
+    subchunkify(paste(name, '_sizefactor2'), input='plot')
+    cat('\n\n')
+    }
+```
+
+
+
+## Dispersion {.tabset}
+
+The DESeq2 dispersion estimates are inversely related to the mean and directly related to variance. 
+Based on this relationship, the dispersion is higher for small mean counts and lower for large mean 
+counts. Therefore, the dispersion estimates reflect the variance in gene expression for a given 
+mean value. 
+
+DESeq2 shares information across genes to generate more accurate estimates of variation based on 
+the mean expression level of the gene using a method called ‘shrinkage’. DESeq2 assumes that genes
+with similar expression levels have similar dispersion.
+
+
+```{r dispersion, fig.width=8, fig.height=6, results='asis'}
+
+for (subset in names(dds.list)) {
+
+    cat('###', subset, '\n\n')
+    DESeq2::plotDispEsts(dds.list[[subset]])
+    cat('\n\n')
+}
+
+```
+
+# (Optional) Removal of outliers
+
+In QC, we identified outliers. Before moving onto DE testing, we remove those outliers.
+
+```{r remove_outlier, cache=TRUE, dependson='prep_metadata'}
+
+
+if (outlier == '') {
+    print("Outlier not found!")
+} else {
+    print(paste(outlier, "removed..."))
+    # Update coldata to exclude outliers
+    coldata.list <- lapply(
+        coldata.list,
+        function(df) df %>%
+            rownames_to_column('samplename') %>%
+            dplyr::filter(! samplename %in% outlier) %>%
+            column_to_rownames('samplename')
+        )
+}
+
+# Filter contrasts of interest
+coldata.list <- coldata.list[-1]
+
+# Build a list of dds obj
+dds.list <- mclapply(
+    names(coldata.list),
+    function(name) DESeqDataSetFromMatrix(
+        count.df[, rownames(coldata.list[[name]])],
+        colData=coldata.list[[name]],
+        design=~cluster + 0
+        )
+    ) %>%
+    mclapply(DESeq, parallel=TRUE) %>%
+    set_names(names(coldata.list))
+
+# Run vst
+vsd.list <- mclapply(
+    dds.list, 
+    varianceStabilizingTransformation,
+    blind=TRUE)
+```
+
+
+# Differential expression
+
+Differential expression analysis is summarized using the following metrics:
+
+- **row name**: subset
+- **nonzero.vs.total**: the number of genes with nonzero read counts and 
+  the total number of annotated genes
+- **alpha**: false discovery rate (FDR) cutoff determining significant genes
+- **lfcThreshold**: by default, the null hypothesis is that the log2 fold change
+  of genes is not different from zero. In some circumstances, it is useful to use
+  a different threshold, which will be reported here.
+- **outliers**: Cook’s distance is used as a measure of how much a single sample 
+  is influencing the fitted coefficients for a gene. If that value is too high, 
+  the gene is marked as an outlier and the pvalue and adjusted pvalue will be set to NA. 
+  If there are many (hundreds to thousands) of outliers, this is an indication 
+  that a sample may be problematic. In this case, the dds diagnostics plots may
+  help identify the culprit.
+- **low.counts**: How many genes were not even tested for differential expression 
+  because they had too low counts.
+- **test**: The contrast performed using the design. `A vs B` indicates differential
+  expression of genes in A (experimental) compared to B (control).
+
+
+```{r run_deseq2, dependson='setup_deseq2', cache=TRUE}
+
+# Calculate results
+res.list <- mclapply(dds.list, results)
+
+# Run shrinkage
+res.list <- mclapply(
+    names(res.list),
+    function(name) lfcShrink(dds.list[[name]], res=res.list[[name]], type="ashr")
+    ) %>%
+    set_names(names(dds.list))
+
+```
+
+
+```{r res_summary, results='asis'}
+
+
+# Summarize testing results across the subsets
+res.summary.list <- lapply(names(res.list), function(name) {
+
+    # Assign res and dds
+    res <- res.list[[name]]
+    dds <- dds.list[[name]]
+
+    # Calculate summary metrics
+    notallzero <- sum(res$baseMean > 0)
+    up <- sum(res$padj < alpha & res$log2FoldChange > lfc.thresh, na.rm=TRUE)
+    down <- sum(res$padj < alpha & res$log2FoldChange < -lfc.thresh, na.rm=TRUE)
+    filt <- sum(!is.na(res$pvalue) & is.na(res$padj))
+    outlier <- sum(res$baseMean > 0 & is.na(res$pvalue))
+    test <- mcols(res)['log2FoldChange', 'description']
+
+    # Create a final summary data frame
+    df <- data.frame(
+        up=up,
+        down=down,
+        nonzero.vs.total=paste0(notallzero, '/', nrow(res)), 
+        alpha=alpha,
+        lfcThreshold=lfc.thresh,
+        outliers=outlier,
+        low.counts=filt,
+        # adjust width.cutoff here because newline insertion causes this to return
+        # a df with multiple duplicate rows
+        design=deparse(design(dds), width.cutoff=500L),
+        test=test
+    )
+
+    return(df) }) %>%
+    set_names(names(res.list))
+
+# Reorder rows
+df <- do.call("rbind", res.summary.list)[names(res.summary.list),]
+
+# Print
+DT::datatable(df)
+```
+
+
+# MA plots {.tabset}
+
+An MA plot gives a good overview of the comparison. There is one dot per gene. It shows 
+three dimensions: the normalized counts (baseMean, on a log10 scale, x-axis), the effect size 
+(log2FoldChange, y-axis) and whether or not a gene was signficant (color). While it is tempting 
+to interpret baseMean as “expression level”, this would not be correct because the values are 
+only normalized to library size, not transcript length. We can say that a gene with higher baseMean
+than another gene has more observed reads, but we cannot say whether that is because it has a longer
+transcript or because there are more transcripts.
+
+The top 10 log2FoldChange genes are displayed.
+
+
+```{r exploratory_plots, results='asis', fig.width=8, fig.height=6}
+
+for (subset in names(res.list)) {
+
+    res <- res.list[[subset]]
+
+    # convert res to data frame
+    res <- data.frame(res) %>%
+        arrange(desc(abs(log2FoldChange))) %>%
+        rownames_to_column('Symbol')
+
+    rownames(res) <- res$Symbol
+
+    # Create a vector storing top log2FoldChange gene symbols
+    genes_to_label <- res$Symbol[1:10]
+
+    # if y limits not specified
+    fc_lim <- range(res$log2FoldChange, na.rm=TRUE)
+    fc_lim[1] <- floor(fc_lim[1])
+    fc_lim[2] <- ceiling(fc_lim[2])
+
+    # get data frame of genes outside plot limits
+    up.max <- res[res$log2FoldChange > fc_lim[2],]
+    up.max$log2FoldChange <- rep(fc_lim[2], dim(up.max)[1])
+    up.max <- data.frame(genes=rownames(up.max), up.max)
+
+    down.max <- res[res$log2FoldChange < fc_lim[1],]
+    down.max$log2FoldChange <- rep(fc_lim[1], dim(down.max)[1])
+    down.max <- data.frame(genes=rownames(down.max), down.max)
+
+    # get data frame of DE genes
+    de.list <- res[res$padj < alpha &
+                 !is.na(res$padj) &
+                 abs(res$log2FoldChange) >= alpha,]
+    de.list <- data.frame(genes=rownames(de.list), de.list)
+
+    # get data frame of DE genes outside plot limits
+    up.max.de <- up.max[rownames(up.max) %in% rownames(de.list),]
+    down.max.de <- down.max[rownames(down.max) %in% rownames(de.list),]
+
+    # create ggplot with appropriate layers
+    p <- ggplot(res, aes(baseMean, log2FoldChange)) +
+        geom_point(col="gray40") +
+        scale_x_log10() +
+        ylim(fc_lim[1], fc_lim[2]) +
+        theme_bw() +
+        theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank()) +
+        geom_hline(yintercept = 0, col="red", size=2, alpha=0.5) +  # add horizontal line
+        geom_point(data=up.max, col="gray40", pch=2) +  # add points above max y
+        geom_point(data=down.max, col="gray40", pch=6) +  # add points below min y
+        geom_point(data=de.list, col="red") +  # add DE points 
+        geom_point(data=up.max.de, col="red", pch=2) +  # add DE points above max y 
+        geom_point(data=down.max.de, col="red", pch=6)  # add DE points below min y
+
+
+
+    label.list <- res %>%
+        dplyr::filter(Symbol %in% genes_to_label)
+
+
+    # label genes outside limits
+    up.max.idx <- rownames(label.list) %in% rownames(up.max)
+    down.max.idx <- rownames(label.list) %in% rownames(down.max)
+
+    if(sum(up.max.idx) > 0){
+      label.list$log2FoldChange[up.max.idx] <- rep(fc_lim[2], sum(up.max.idx))
+    }
+
+    if(sum(down.max.idx) > 0){
+      label.list$log2FoldChange[down.max.idx] <- rep(fc_lim[1], sum(down.max.idx))
+    }
+
+    # add labels
+    p <- p + geom_point(data=label.list, col="black", pch=1, size=3)
+    p <- p + ggrepel:::geom_label_repel(data=label.list, aes(label=label.list$Symbol, fontface="italic"))
+
+    file.i <- file.path(de.out, paste0(subset, '_DE_MAplot.pdf'))
+    ggsave(file.i, p)
+
+    cat('\n\n##', subset, '\n\n')
+    link.plot(file.i)
+    print(p)
+    cat('\n\n')
+}
+```
+
+
+
+# P-value distribution {.tabset}
+
+```{r de_diagnosis, results='asis', fig.width=8, fig.height=6}
+
+for (subset in names(res.list)) {
+    res <- res.list[[subset]]
+    
+    cat('\n\n##', subset, '\n\n')
+
+    use <- res$baseMean > metadata(res)$filterThreshold
+    h1 <- hist(res$pvalue[!use], breaks=0:50/50, plot=FALSE)
+    h2 <- hist(res$pvalue[use], breaks=0:50/50, plot=FALSE)
+    colori <- c(`counts too low`='khaki', `pass`="powderblue")
+    barplot(height = rbind(h1$counts, h2$counts), beside = FALSE,
+          col = colori, space = 0, main = "", ylab="frequency")
+    text(x = c(0, length(h1$counts)), y = 0, label = paste(c(0,1)),
+       adj = c(0.5,1.7), xpd=NA)
+    legend("topright", fill=rev(colori), legend=rev(names(colori)))
+
+}
+
+```
+
+# UpSet plots {.tabset}
+
+
+Here we gather together all the interesting gene sets into an UpSet plot. These plots 
+show the combinatorial overlaps of genes found to be up or down across the different
+contrasts performed. It’s much like a Venn diagram, but easier to interpret and can
+scale to many comparisons.
+
+The plot shows a summary of which genes were found in common across contrasts. If you want
+to know the details of which genes were found in common, a TSV file is linked under each plot. 
+This file has rows for each gene and columns for each contrast. A 1 indicates that gene was found 
+to be up/down/changed in that contrast. You can sort this TSV to identify the genes of interest. 
+For example, sorting all columns in descending order will cause genes shared in all contrasts 
+(a 1 in each column) to come to the top.
+
+**Interpretation notes**: A gene can only be found in one column in an UpSet plot. So if you 
+want to confirm that the number of genes for a contrast matches the results tables and MA plots,
+sum all the bars for which there is a dot in that contrast’s row.
+
+The upset plot was recapitulated to a table (`X_upsettable.tsv`) having 1 if a gene is found and
+0 otherwise per subset denoted by column and prey denoted by row.
+
+DEGs are partitioned into:
+
+- **`dn`**: log2FoldChange < 0
+- **`up`**: log2FoldChange > 0
+- **`changed`**: union of `dn` and `up`
+
+
+```{r upset_plot, results='asis'}
+
+# Create a list storing result data frames where only significant genes are left
+sig.df.list <- lapply(names(res.list), function(name) {
+    df <- as.data.frame(res.list[[name]]) %>%
+        # Filter significant genes based on FDR and/or log2FoldChange cutoffs
+        dplyr::filter(!is.na(padj) & padj < alpha)
+
+    if (lfc.thresh != 0) {
+        df <- df %>% dplyr::filter(abs(log2FoldChange) > lfc.thresh)
+    }
+
+    # Add a column indicating change directions
+    df <- df %>% mutate(Direction=ifelse(log2FoldChange > 0, 'up', 'dn'),
+           # Add a column indicating subset name
+           cells_from=name) %>%
+        rownames_to_column('Symbol')
+    return(df) })
+
+
+# Merge the list to a data frame
+res.df <- do.call("rbind", sig.df.list)
+
+
+# Split the data frame by change direction
+upset.input.list <- split(res.df, res.df$Direction)
+upset.input.list[["changed"]] <- res.df
+
+# Split futher the sub-data frames by subset
+upset.input.list <- lapply(
+    upset.input.list,
+    function(df) lapply(split(df, df$cells_from), function(df) unique(df$Symbol))
+    )
+
+for (name in names(upset.input.list)) {
+
+    cat('\n\n##', name, 'genes\n\n')
+
+    # Extract per-direction list
+    upset.list <- upset.input.list[[name]]
+
+    p <- upset(
+        fromList(upset.list),
+        order.by='freq',
+        sets=names(upset.list),
+        keep.order=TRUE,
+        number.angles=15,
+        nsets=length(upset.list),
+        text.scale=c(2, 1.8, 1.3, 1.3, 2, 1.7),
+        point.size=3)
+    subchunkify(paste0(name, '_upset'), input='plot', 14, 8, FALSE)
+    cat('\n\n')
+
+    # Create and save upset table
+    upset.df <- data.frame(Symbol=unique(unlist(upset.list)))
+    rownames(upset.df) <- NULL
+
+    for (subset in names(upset.list)) {
+        upset.df[[subset]] <- ifelse(upset.df$Symbol %in% upset.list[[subset]], 1, 0)
+    }
+
+    file.i <- file.path(de.out, paste0(name, '_upsettable.tsv'))
+    write.table(
+        upset.df,
+        file=file.i,
+        sep='\t',
+        row.names=FALSE,
+        col.names=TRUE,
+        quote=FALSE
+        )
+    link.table(file.i)
+}
+```
+
+
+# Exported results
+
+The files below are TSVs that can be opened in Excel or used progammatically with downstream tools.
+
+Result metrics
+
+* `baseMean`: mean of normalized counts for all samples
+* `log2FoldChange`: log2 fold change
+* `lfcSE`: standard error
+* `stat`: Wald statistic
+* `pvalue`: Wald test p-value
+* `padj`: False discovery rate (FDR)
+
+
+```{r exported_results, results='asis'}
+
+res.export.list <- lapply(names(res.list), function(subset) {
+    res.df <- as.data.frame(res.list[[subset]]) %>%
+        rownames_to_column('Symbol')
+    file.i <- file.path(de.out, paste0(subset, '_DE.tsv'))
+    write.table(
+        res.df,
+        file=file.i,
+        sep='\t',
+        row.names=FALSE,
+        col.names=TRUE,
+        quote=FALSE
+        )
+    return(paste('[', file.i, '](', file.i, ')'))
+        }) %>%
+    set_names(names(res.list))
+
+print(knitr::kable(data.frame(link=unlist(res.export.list))))
+```
+
+
+```{r shiny}
+
+# Update `res.list`
+res.list <- lapply(names(res.list), function(subset) 
+    list(res=res.list[[subset]],
+         dds=dds.list[[subset]],
+         label=subset)) %>%
+    set_names(names(dds.list))
+
+saveRDS(
+    res.list,
+    file=file.path(rds, "pseudobulk_de.rds")
+    )
+
+```
+
+
+
+# Session info
+
+For reproducibility purposes, here is the output of `sessionInfo()` showing the
+versions of all packages used here.
+
+```{r session_info, collapse=FALSE}
+
+sessionInfo()
+
+```
